@@ -28,7 +28,7 @@ from jw_harness.llm import BudgetExhausted, from_env
 
 # Measured mean cost per task in budget units (bench/runs, qwen3.6-35b-a3b-noreason).
 EST = {"math": 70, "coding_per_failure": 35, "coding_base": 20,
-       "data_analysis": 250, "search": 300, "other": 1500}
+       "data": 40, "search_kb": 25, "data_analysis": 250, "search": 300, "other": 1500}
 TIME_LIMIT_S = float(os.environ.get("TIME_LIMIT_S", 52 * 60))  # the container is killed at 60 min
 
 
@@ -96,8 +96,18 @@ def recon(t: dict) -> None:
     if ttype == "math" and not ws.is_dir():
         t["_kind"], t["_est"] = "math", EST["math"]
         return
-    t["_kind"] = "agent"
-    t["_est"] = EST.get(ttype, EST["other"])
+    kb = solvers.load_kb(ws) if ttype == "search" else None
+    if kb is not None:
+        t["_kind"], t["_est"] = "search", EST["search_kb"]
+        q = solvers.search_question(instr)
+        if not kb.mentioned(q) and kb.unknown_names(q):
+            t["_impossible"] = f"names {kb.unknown_names(q)} not in kb"
+        return
+    if ttype == "data_analysis" and solvers.has_csv(ws):
+        t["_kind"], t["_est"] = "data", EST["data"]
+    else:
+        t["_kind"] = "agent"
+        t["_est"] = EST.get(ttype, EST["other"])
     if not ws.is_dir():
         if ttype in ("search", "data_analysis"):
             t["_suspect"] = "no workspace"
@@ -155,6 +165,10 @@ async def solve_one(llm, t: dict, sols: Solutions, traj_dir: Path, deadline: flo
             res = await solvers.solve_coding(llm, d, t, trace)
         elif t["_kind"] == "math":
             res = await solvers.solve_math(llm, d, t, trace)
+        elif t["_kind"] == "data":
+            res = await solvers.solve_data(llm, d, t, trace)
+        elif t["_kind"] == "search":
+            res = await solvers.solve_search(llm, d, t, trace)
         if res is None:
             if t["_suspect"]:  # likely infeasible: a short, cheap look only
                 res = await solvers.solve_agent(llm, d, t, trace, max_steps=3, cost_cap=300)

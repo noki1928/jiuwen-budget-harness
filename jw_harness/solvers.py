@@ -231,6 +231,111 @@ async def solve_math(llm: LLM, task_dir: Path, task: dict, log: list) -> Result:
     return Result(False, "", cost, "no evaluable program")
 
 
+# ---------------------------------------------------------------- data_analysis
+# One query through a safe executor (dataq.py). Measured on 62 tasks: SQL 61/62 at ~33
+# units, pandas 60-62/62 at ~37, the agent loop 61/62 at ~214. Failures of the two
+# models never overlapped, so the second step uses the other model and language.
+SYS_QUERY = {
+    "sql": "Reply with one SQLite SELECT query that answers the question. Tables are shown below.",
+    "pandas": "Reply with one pandas expression that answers the question. "
+              "DataFrames are shown below by name; df is the first one.",
+}
+
+
+def data_question(instr: str) -> str:
+    return re.sub(r"^The file \S+ has columns \S+ \(\d+ rows\)\.\s*", "", instruction_core(instr))
+
+
+def has_csv(ws: Path) -> bool:
+    return ws.is_dir() and any(ws.rglob("*.csv"))
+
+
+async def solve_data(llm: LLM, task_dir: Path, task: dict, log: list) -> Result | None:
+    from . import dataq  # pandas import is heavy: only when a data task shows up
+    ws = task_dir / "workspace"
+    user = f"{dataq.preview(ws)}\n\nQ: {data_question(task['instruction'])}"
+    cost = 0.0
+    for model, mode in ((CHEAP, "sql"), (SECOND, "pandas")):
+        msgs = [{"role": "user", "content": user}]
+        for _ in range(2):  # one retry with the execution error
+            reply, c = await llm.ask(SYS_QUERY[mode], msgs, model=model, max_tokens=300)
+            cost += c
+            err, ans = "", None
+            try:
+                ans = await asyncio.to_thread(dataq.RUNNERS[mode], ws, reply)
+                if ans is None:
+                    err = "query returned no value"
+            except Exception as e:  # noqa: BLE001
+                err = f"{type(e).__name__}: {str(e)[:200]}"
+            log.append({"model": model, "mode": mode, "reply": reply, "answer": ans, "error": err, "cost": c})
+            if not err:
+                write_answer(task_dir, ans)
+                return Result(True, ans, cost)
+            msgs += [{"role": "assistant", "content": reply},
+                     {"role": "user", "content": f"Error: {err}\nReply with a corrected query only."}]
+    return None  # let the agent loop try
+
+
+# ---------------------------------------------------------------- search
+# The kb is parsed into an entity graph by the wrapper (kbgraph.py). Measured on 62 tasks
+# (1-3 hops, 7 infeasible): subgraph 62/62 at ~20 units on both models, path query 62/62
+# (35b) / 61/62 (27b) at ~20, whole kb 49/62 at ~89, the agent loop ~180-280.
+SYS_SUBGRAPH = "Answer from the facts below with the value only. If they do not contain the answer, reply IMPOSSIBLE."
+SYS_PATH = ("Reply with a path that answers the question: the name from the question, then fields from the list. "
+            "Example: Anna Kim > Employer > Headquarters. If the data cannot answer it, reply IMPOSSIBLE.")
+
+
+def search_question(instr: str) -> str:
+    return re.sub(r"^The directory \S+ contains [^.]*\.\s*", "", instruction_core(instr))
+
+
+def load_kb(ws: Path):
+    from . import kbgraph
+    return kbgraph.load(ws) if ws.is_dir() else None
+
+
+def _value(reply: str) -> str | None:
+    v = reply.strip().strip("`*\"'. ").splitlines()[0].strip() if reply.strip() else ""
+    v = re.sub(r"^(answer|value)\s*:\s*", "", v, flags=re.I)
+    return None if not v or v.upper().startswith("IMPOSSIBLE") else v
+
+
+async def solve_search(llm: LLM, task_dir: Path, task: dict, log: list) -> Result | None:
+    kb = load_kb(task_dir / "workspace")
+    if kb is None:
+        return None  # not a field-based kb: the agent loop handles it
+    q = search_question(task["instruction"])
+    cost = 0.0
+    facts = kb.subgraph(q)
+    if facts:
+        reply, c = await llm.ask(SYS_SUBGRAPH, f"{facts}\n\nQ: {q}", model=CHEAP, max_tokens=60)
+        cost += c
+        ans = _value(reply)
+        log.append({"model": CHEAP, "mode": "subgraph", "reply": reply, "answer": ans, "cost": c})
+        if ans:
+            write_answer(task_dir, ans)
+            return Result(True, ans, cost)
+    # second opinion with the other model and the other view before giving up
+    ment = kb.mentioned(q)
+    msgs = [{"role": "user", "content": f"Fields:\n{kb.schema()}\n\nQ: {q}"}]
+    for _ in range(2):
+        reply, c = await llm.ask(SYS_PATH, msgs, model=SECOND, max_tokens=60)
+        cost += c
+        try:
+            ans, err = kb.follow(reply, ment[0] if len(ment) == 1 else None), ""
+        except LookupError as e:
+            ans, err = None, str(e)
+        log.append({"model": SECOND, "mode": "path", "reply": reply, "answer": ans, "error": err, "cost": c})
+        if ans:
+            write_answer(task_dir, ans)
+            return Result(True, ans, cost)
+        if err == "IMPOSSIBLE":
+            break
+        msgs += [{"role": "assistant", "content": reply},
+                 {"role": "user", "content": f"Error: {err}\nReply with a corrected path or IMPOSSIBLE."}]
+    return Result(False, "", cost, "kb has no answer")
+
+
 # ---------------------------------------------------------------- generic agent
 def workspace_preview(ws: Path, budget: int = 1800) -> str:
     if not ws.is_dir():
