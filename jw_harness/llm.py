@@ -37,6 +37,10 @@ class BudgetExhausted(Exception):
     pass
 
 
+class ProxyUnavailable(Exception):
+    """Connection-level failure after retries: the task should be retried later, not failed."""
+
+
 @dataclass
 class Spend:
     units: float = 0.0
@@ -100,6 +104,9 @@ class LLM:
                 self.dead = True
                 raise BudgetExhausted(str(last)[:200])
             break
+        text = str(last).lower()
+        if any(s in text for s in ("connection", "timeout", "timed out", "name resolution", "502", "503", "504")):
+            raise ProxyUnavailable(str(last)[:200])
         raise RuntimeError(f"llm failed: {str(last)[:300]}")
 
 

@@ -147,8 +147,37 @@ class KB:
         return cur  # a bare entity name was asked for
 
 
+def _fields(lines: list[str]) -> dict[str, str]:
+    fields = {}
+    for l in lines:
+        m = FIELD_RE.match(l.replace("*", ""))
+        if m and not l.startswith("#"):
+            fields[m.group(1).strip()] = m.group(2).strip()
+    return fields
+
+
+def _sections(lines: list[str]) -> list[tuple[str, list[str]]]:
+    """'## Name' sections of a page that holds many entities (a wiki / directory page)."""
+    out, title, body = [], None, []
+    for l in lines:
+        m = re.match(r"^#{2,4}\s+(.+?)\s*#*$", l)
+        if m:
+            if title is not None:
+                out.append((title, body))
+            title, body = m.group(1).strip(), []
+        elif title is not None:
+            body.append(l)
+    if title is not None:
+        out.append((title, body))
+    return out
+
+
 def load(ws: Path) -> KB | None:
-    """Parse markdown/text files; None when the files do not look like a field-based kb."""
+    """Parse markdown/text files; None when the files do not look like a field-based kb.
+
+    One file per entity ("# Title" + fields), or several entities per file as
+    "## Title" sections with their own fields.
+    """
     files = sorted(p for p in ws.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".txt", ".markdown"))
     if not files:
         return None
@@ -160,19 +189,24 @@ def load(ws: Path) -> KB | None:
             lines = p.read_text(errors="replace").splitlines()
         except OSError:
             continue
+        kind = p.stem.split("_", 1)[0] if "_" in p.stem else "entity"
+        secs = [(t, _fields(b)) for t, b in _sections(lines)]
+        secs = [(t, f) for t, f in secs if f]
+        if len(secs) >= 2:
+            structured += 1
+            for t, f in secs:
+                ents[t] = f
+                kinds[t] = kind
+            continue
         title = next((l.lstrip("#").strip() for l in lines if l.startswith("#")), "")
         if not title:
             stem = p.stem.split("_", 1)[-1] if "_" in p.stem else p.stem
             title = stem.replace("_", " ").title()
-        fields = {}
-        for l in lines:
-            m = FIELD_RE.match(l.replace("*", ""))
-            if m and not l.startswith("#"):
-                fields[m.group(1).strip()] = m.group(2).strip()
+        fields = _fields(lines)
         if fields:
             structured += 1
         ents[title] = fields
-        kinds[title] = p.stem.split("_", 1)[0] if "_" in p.stem else "entity"
+        kinds[title] = kind
     if structured < 0.6 * len(files):
         return None
     return KB(ents, kinds)

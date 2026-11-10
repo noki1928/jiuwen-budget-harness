@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import subprocess
+import textwrap
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from .mathfix import solve_reply
 # ---------------------------------------------------------------- prompts
 # Measured on 104 tasks (bench/): see README for the numbers behind each choice.
 SYS_LINE = "Fix the bugs. Output only changed lines as N: code (indent auto). Nothing else."
+SYS_LINE_MULTI = "Fix the bugs. Output only changed lines as file:N: code (indent auto). Nothing else."
 SYS_FUNC = ("You fix bugs in Python. Reply ONLY with the corrected function definitions "
             "in one ```python block. No prose.")
 SYS_STEPS = (
@@ -27,7 +29,7 @@ SYS_STEPS = (
     "ceil(a/b) for rounding up, % for remainder.\n"
     "Percent loss p%: x -= x*p//100; percent growth: x += x*p//100. "
     "The final value must be exactly the quantity asked in the question. "
-    "The last line must set x to the answer.\n"
+    "The last line must set x to the answer (a string if the answer is a word, e.g. a weekday).\n"
     "Example:\nx = 1000\nx -= 3*20\nx //= 2\nx -= x*10//100\n"
     "Reply ONLY with the code."
 )
@@ -96,16 +98,26 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> subprocess.CompletedPr
 
 
 # ---------------------------------------------------------------- coding
-def coding_target(task: dict, ws: Path) -> tuple[str, str] | None:
-    """(test file, file to fix) parsed from the instruction, or None if not this task shape."""
+TEST_FILE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$")
+
+
+def coding_target(task: dict, ws: Path) -> tuple[str, list[str]] | None:
+    """(test file, source files to fix) parsed from the instruction, or None if not this task shape.
+
+    "Fix the bugs in mylib.py" names the file; otherwise every non-test .py file in the
+    workspace is a candidate (packages like shop/cart.py + shop/pricing.py).
+    """
     instr = task.get("instruction", "")
     m = re.search(r"python3?\s+([\w./-]+\.py)", instr)
-    test = m.group(1) if m else "test_mylib.py"
+    if not m or not (ws / m.group(1)).is_file():
+        return None
+    test = m.group(1)
     m = re.search(r"bugs in\s+([\w./-]+\.py)", instr)
-    lib = m.group(1) if m else "mylib.py"
-    if (ws / test).is_file() and (ws / lib).is_file():
-        return test, lib
-    return None
+    if m and (ws / m.group(1)).is_file():
+        return test, [m.group(1)]
+    libs = sorted(str(p.relative_to(ws)) for p in ws.rglob("*.py")
+                  if not TEST_FILE.search(str(p.relative_to(ws))) and "__pycache__" not in p.parts)
+    return (test, libs) if libs else None
 
 
 _CONST_NODES = (ast.Expression, ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.BinOp, ast.UnaryOp,
@@ -122,12 +134,39 @@ def _const_value(node: ast.AST):
     return eval(compile(expr, "<expected>", "eval"), {"__builtins__": {}}, {})
 
 
+def _pure_call(node: ast.AST, modules: set[str]) -> bool:
+    """module.func(<literals>): the same expression always means the same result.
+
+    Attributes of objects (inv.items['nut']) or calls on instances change between asserts,
+    so they can not prove a contradiction.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    while isinstance(f, ast.Attribute):
+        f = f.value
+    if not (isinstance(f, ast.Name) and f.id in modules):
+        return False
+    try:
+        for a in list(node.args) + [k.value for k in node.keywords]:
+            _const_value(a)
+    except (ValueError, TypeError, SyntaxError, ArithmeticError):
+        return False
+    return True
+
+
 def contradictory_tests(ws: Path, test: str) -> str:
-    """The same call is expected to give different values -> no fix can pass all tests."""
+    """The same pure call is expected to give different values -> no fix can pass all tests."""
     try:
         tree = ast.parse((ws / test).read_text())
     except (SyntaxError, OSError):
         return ""
+    modules = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            modules |= {(a.asname or a.name).split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom) and n.module:
+            modules |= {a.asname or a.name for a in n.names if a.name[:1].islower() and "." not in a.name}
     seen: dict[str, set[str]] = {}
     for n in ast.walk(tree):
         if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.args):
@@ -136,10 +175,11 @@ def contradictory_tests(ws: Path, test: str) -> str:
         try:
             if attr == "assertEqual" and len(n.args) >= 2:
                 a, b = n.args[0], n.args[1]
-                if isinstance(a, ast.Constant) and not isinstance(b, ast.Constant):
+                if not _pure_call(a, modules):
                     a, b = b, a
-                seen.setdefault(ast.unparse(a), set()).add(repr(_const_value(b)))
-            elif attr in ("assertTrue", "assertFalse"):
+                if _pure_call(a, modules):
+                    seen.setdefault(ast.unparse(a), set()).add(repr(_const_value(b)))
+            elif attr in ("assertTrue", "assertFalse") and _pure_call(n.args[0], modules):
                 seen.setdefault(f"bool({ast.unparse(n.args[0])})", set()).add(repr(attr == "assertTrue"))
         except (ValueError, TypeError, SyntaxError, ArithmeticError):
             continue
@@ -155,86 +195,146 @@ def run_tests(ws: Path, test: str) -> str:
     return "" if p.returncode == 0 else (p.stdout + p.stderr)
 
 
-def failing(report: str, src: str, mod: str) -> tuple[list[str], set[str]]:
-    funcs = {n.name for n in ast.parse(src).body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
-    descs, names = [], set()
-    for block in re.split(r"^={10,}$", report, flags=re.M)[1:]:
-        lines = [l for l in block.strip().splitlines() if l.strip()]
-        call = next((l.strip() for l in lines if "self.assert" in l), "")
-        err = next((l.strip() for l in reversed(lines)
-                    if re.match(r"\w*(Error|Exception)\b", l.strip())), "")
-        names.update(n for n in re.findall(r"\b\w+\.(\w+)\(", call) if n in funcs)
-        names.update(n for n in re.findall(rf'{re.escape(mod)}", line \d+, in (\w+)', block) if n in funcs)
-        descs.append(f"{call}  -> {err}" if call else err)
-    if not names and report:  # import error / unknown failure shape: show everything
-        names = funcs
-        descs = descs or report.strip().splitlines()[-4:]
-    return descs[:8], names
-
-
-def spans(src: str) -> dict[str, tuple[int, int]]:
-    return {n.name: (n.lineno, n.end_lineno) for n in ast.parse(src).body
-            if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
-
-
-def coding_prompt(mode: str, src: str, descs: list[str], names: set[str]) -> str:
-    lines, sp = src.splitlines(), spans(src)
-    chunks = []
-    for n in sorted(names, key=lambda k: sp[k][0]):
-        a, b = sp[n]
-        if mode == "line":
-            chunks.append("\n".join(f"{i}: {lines[i - 1]}" for i in range(a, b + 1)))
-        else:
-            chunks.append("\n".join(lines[a - 1:b]))
-    return "Failing:\n" + "\n".join(descs) + "\n\nCode:\n" + "\n\n".join(chunks)
-
-
-def apply_line(src: str, reply: str) -> str:
-    lines = src.splitlines()
-    for m in re.finditer(r"^\s*(\d+)\s*[:|]\s?(.*)$", reply, flags=re.M):
-        i = int(m.group(1))
-        if 1 <= i <= len(lines):
-            old = lines[i - 1]
-            code = m.group(2).strip()
-            if old.strip():
-                # indentation is always taken from the original line: models miscount spaces
-                lines[i - 1] = old[:len(old) - len(old.lstrip())] + code
-            elif code:
-                # the model grew a function into the blank line after it: use the body's indent,
-                # keep the blank separator
-                prev = next((l for l in reversed(lines[:i - 1]) if l.strip()), "")
-                indent = prev[:len(prev) - len(prev.lstrip())] or "    "
-                lines[i - 1] = indent + code + "\n"
-    out = "\n".join(lines) + "\n"
-    try:
-        compile(out, "mylib.py", "exec")  # ast.parse misses e.g. 'return' outside a function
-    except SyntaxError:
-        return src
+def units(srcs: dict[str, str]) -> list[tuple[str, str, int, int]]:
+    """(file, name, first line, last line) of every function and method."""
+    out = []
+    for f, src in srcs.items():
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                start = n.decorator_list[0].lineno if n.decorator_list else n.lineno
+                out.append((f, n.name, start, n.end_lineno))
     return out
 
 
-def apply_func(src: str, reply: str) -> str:
+def failing(report: str, srcs: dict[str, str]) -> tuple[list[str], list[tuple[str, str, int, int]]]:
+    """Short failure descriptions and the code units to show."""
+    us = units(srcs)
+    picked: list = []
+
+    def add(u):
+        if u not in picked:
+            picked.append(u)
+
+    descs = []
+    blocks = re.split(r"^={10,}$", report, flags=re.M)[1:] or [report]
+    for block in blocks:
+        lines = [l for l in block.strip().splitlines() if l.strip()]
+        call = next((l.strip() for l in lines if "self.assert" in l or l.strip().startswith("assert ")), "")
+        err = next((l.strip() for l in reversed(lines) if re.match(r"[\w.]*(Error|Exception)\b", l.strip())), "")
+        descs.append(f"{call}  -> {err}" if call else err)
+        # frames inside the sources: the innermost unit around the reported line
+        for fpath, line in re.findall(r'File "([^"]+)", line (\d+)', block):
+            for f in srcs:
+                if fpath.endswith("/" + f) or fpath == f:
+                    inside = [u for u in us if u[0] == f and u[2] <= int(line) <= u[3]]
+                    if inside:
+                        add(min(inside, key=lambda u: u[3] - u[2]))
+        for name in re.findall(r"\b(\w+)\(", call):
+            for u in us:
+                if u[1] == name:
+                    add(u)
+    if not picked and report:  # import error / unknown failure shape: show everything (bounded)
+        picked = us[:12]
+        descs = [d for d in descs if d] or report.strip().splitlines()[-4:]
+    return [d for d in descs if d][:8], picked
+
+
+def coding_prompt(mode: str, srcs: dict[str, str], descs: list[str], picked: list) -> str:
+    many = len({u[0] for u in picked}) > 1
+    chunks = []
+    for f in dict.fromkeys(u[0] for u in picked):
+        lines = srcs[f].splitlines()
+        body = []
+        for u in sorted((u for u in picked if u[0] == f), key=lambda u: u[2]):
+            if any(o is not u and o[0] == f and o[2] <= u[2] and u[3] <= o[3] for o in picked):
+                continue  # nested inside another shown unit
+            rng = range(u[2], u[3] + 1)
+            body.append("\n".join((f"{i}: {lines[i - 1]}" if mode == "line" else lines[i - 1]) for i in rng))
+        chunks.append((f"# file: {f}\n" if many else "") + "\n\n".join(body))
+    return "Failing:\n" + "\n".join(descs) + "\n\nCode:\n" + "\n\n".join(chunks)
+
+
+def apply_line(srcs: dict[str, str], reply: str, shown: list | None = None) -> dict[str, str]:
+    """Apply 'N: code' / 'file:N: code' replacements; every touched file must still compile."""
+    files = list(srcs)
+    shown_files = list(dict.fromkeys(u[0] for u in (shown or []))) or files
+    lines = {f: srcs[f].splitlines() for f in files}
+    for m in re.finditer(r"^\s*(?:([\w./-]+\.py)\s*:\s*)?(\d+)\s*[:|]\s?(.*)$", reply, flags=re.M):
+        f, i, code = m.group(1), int(m.group(2)), m.group(3).strip()
+        if f:
+            f = next((x for x in files if x == f or x.endswith("/" + f) or f.endswith("/" + x)), None)
+        elif len(shown_files) == 1:
+            f = shown_files[0]
+        else:  # several files shown, no file given: the shown unit that contains the line
+            cand = {u[0] for u in (shown or []) if u[2] <= i <= u[3] + 1}
+            f = cand.pop() if len(cand) == 1 else None
+        if f is None or not (1 <= i <= len(lines[f])):
+            continue
+        ls = lines[f]
+        old = ls[i - 1]
+        if old.strip():
+            # indentation is always taken from the original line: models miscount spaces
+            ls[i - 1] = old[:len(old) - len(old.lstrip())] + code
+        elif code:
+            # the model grew a function into the blank line after it: use the body's indent,
+            # keep the blank separator
+            prev = next((l for l in reversed(ls[:i - 1]) if l.strip()), "")
+            indent = prev[:len(prev) - len(prev.lstrip())] or "    "
+            ls[i - 1] = indent + code + "\n"
+    out = dict(srcs)
+    for f in files:
+        new = "\n".join(lines[f]) + "\n"
+        if new.strip() == srcs[f].strip():
+            continue
+        try:
+            compile(new, f, "exec")  # ast.parse misses e.g. 'return' outside a function
+        except SyntaxError:
+            continue
+        out[f] = new
+    return out
+
+
+def apply_func(srcs: dict[str, str], reply: str, shown: list) -> dict[str, str]:
+    """Replace the shown functions/methods by the definitions in the reply (re-indented)."""
     m = re.search(r"```(?:python)?\n(.*?)```", reply, re.S)
-    code = m.group(1) if m else reply
+    code = textwrap.dedent(m.group(1) if m else reply)
     try:
-        new = {n.name: n for n in ast.parse(code).body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        tree = ast.parse(code)
     except SyntaxError:
-        return src
-    code_lines, lines = code.splitlines(), src.splitlines()
-    for name, (a, b) in sorted(spans(src).items(), key=lambda kv: -kv[1][0]):
-        if name in new:
-            n = new[name]
+        return srcs
+    code_lines = code.splitlines()
+    new_defs = {}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             start = n.decorator_list[0].lineno if n.decorator_list else n.lineno
-            lines[a - 1:b] = code_lines[start - 1:n.end_lineno]
-    return "\n".join(lines) + "\n"
+            new_defs.setdefault(n.name, textwrap.dedent("\n".join(code_lines[start - 1:n.end_lineno])))
+    out = dict(srcs)
+    for f in dict.fromkeys(u[0] for u in shown):
+        ls = out[f].splitlines()
+        for (_, name, a, b) in sorted((u for u in shown if u[0] == f), key=lambda u: -u[2]):
+            if name not in new_defs:
+                continue
+            indent = ls[a - 1][:len(ls[a - 1]) - len(ls[a - 1].lstrip())]
+            ls[a - 1:b] = textwrap.indent(new_defs[name], indent).splitlines()
+        new = "\n".join(ls) + "\n"
+        try:
+            compile(new, f, "exec")
+            out[f] = new
+        except SyntaxError:
+            pass
+    return out
 
 
 async def solve_coding(llm: LLM, task_dir: Path, task: dict, log: list) -> Result | None:
     ws = task_dir / "workspace"
     tgt = coding_target(task, ws)
     if tgt is None:
-        return None  # not the "fix lib until tests pass" shape: let the agent handle it
-    test, lib = tgt
+        return None  # not the "fix the code until tests pass" shape: let the agent handle it
+    test, libs = tgt
     cost = 0.0
     # 3 cheap line-edit rounds, then one full-function rewrite by the second model
     plan = [(CHEAP, "line")] * 3 + [(SECOND, "func")]
@@ -246,22 +346,23 @@ async def solve_coding(llm: LLM, task_dir: Path, task: dict, log: list) -> Resul
         report = await asyncio.to_thread(run_tests, ws, test)
         if not report:
             break
-        src = (ws / lib).read_text()
-        try:
-            descs, names = failing(report, src, lib)
-        except SyntaxError:
-            descs, names = report.strip().splitlines()[-4:], set()
-        if not names:
+        srcs = {f: (ws / f).read_text() for f in libs}
+        descs, picked = failing(report, srcs)
+        if not picked:
             break
         if prev == descs and mode == "line":
-            continue  # no progress with the cheap model: jump to the escalation steps
+            continue  # no progress with the cheap model: jump to the escalation step
         prev = descs
-        prompt = coding_prompt(mode, src, descs, names)
-        reply, c = await llm.ask(SYS_LINE if mode == "line" else SYS_FUNC, prompt, model=model,
-                                 max_tokens=300 if mode == "line" else 400)
+        prompt = coding_prompt(mode, srcs, descs, picked)
+        system = SYS_LINE if len({u[0] for u in picked}) == 1 else SYS_LINE_MULTI
+        reply, c = await llm.ask(system if mode == "line" else SYS_FUNC, prompt, model=model,
+                                 max_tokens=300 if mode == "line" else 500)
         cost += c
         log.append({"model": model, "mode": mode, "prompt": prompt, "reply": reply, "cost": c})
-        (ws / lib).write_text(apply_line(src, reply) if mode == "line" else apply_func(src, reply))
+        new = apply_line(srcs, reply, picked) if mode == "line" else apply_func(srcs, reply, picked)
+        for f, txt in new.items():
+            if txt != srcs[f]:
+                (ws / f).write_text(txt)
     ok = await asyncio.to_thread(run_tests, ws, test) == ""
     if ok:
         write_answer(task_dir, "DONE")
@@ -289,9 +390,10 @@ async def _math_try(llm: LLM, q: str, model: str, system: str, log: list) -> tup
     ans = solve_reply(reply)
     log.append({"model": model, "prompt": q, "reply": reply, "answer": ans, "cost": c})
     start = re.search(r"^\s*x\s*=\s*(-?\d+)\s*$", reply, flags=re.M)
-    if start and start.group(1) not in re.findall(r"\d+", q):
-        # e.g. "x = 1000" copied from the prompt example: the question has no starting value
-        return None, c, f"start value {start.group(1)} not in the question"
+    if start and start.group(1) == "1000" and "1000" not in re.findall(r"\d+", q):
+        # "x = 1000" copied from the prompt example: the question has no starting value.
+        # Other constants (365, 7, 0) are legitimate parts of a translation.
+        return None, c, "start value copied from the prompt example"
     if ans is None or ans.startswith("-"):
         return None, c, "no evaluable program"
     return ans, c, ""
@@ -303,7 +405,7 @@ async def solve_math(llm: LLM, task_dir: Path, task: dict, log: list) -> Result:
     for model in (CHEAP, SECOND):
         ans, c, problem = await _math_try(llm, q, model, SYS_STEPS, log)
         cost += c
-        if ans is not None or problem.startswith("start value"):
+        if ans is not None or problem.startswith("start value copied"):
             break
     if ans is None:
         return Result(False, "", cost, problem)
@@ -333,7 +435,14 @@ def data_question(instr: str) -> str:
 
 
 def has_csv(ws: Path) -> bool:
-    return ws.is_dir() and any(ws.rglob("*.csv"))
+    """The workspace has tables the query executors can load (csv/tsv/psv/json/jsonl)."""
+    if not ws.is_dir():
+        return False
+    from . import dataq
+    try:
+        return bool(dataq.load_frames(ws))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def _data_try(llm: LLM, ws: Path, user: str, model: str, mode: str, log: list):
@@ -386,16 +495,14 @@ async def solve_data(llm: LLM, task_dir: Path, task: dict, log: list) -> Result 
 
 
 def _missing_column(err: str, ws: Path) -> bool:
-    """'no such column: discount' / KeyError 'discount' for a name that is in no CSV header."""
+    """'no such column: discount' / KeyError 'discount' for a name that is in no loaded table."""
     m = re.search(r"no such column: (\w+)|KeyError: \W*(\w+)", err)
     if not m:
         return False
+    from . import dataq
     col = (m.group(1) or m.group(2)).lower()
-    headers = set()
-    for p in ws.rglob("*.csv"):
-        with p.open(errors="replace") as f:
-            headers |= {h.strip().lower() for h in f.readline().split(",")}
-    return col not in headers
+    cols = {str(c).lower() for df in dataq.load_frames(ws).values() for c in df.columns}
+    return col not in cols
 
 
 # ---------------------------------------------------------------- search
@@ -405,6 +512,10 @@ def _missing_column(err: str, ws: Path) -> bool:
 SYS_SUBGRAPH = "Answer from the facts below with the value only. If they do not contain the answer, reply IMPOSSIBLE."
 SYS_PATH = ("Reply with a path that answers the question: the name from the question, then fields from the list. "
             "Example: Anna Kim > Employer > Headquarters. If the data cannot answer it, reply IMPOSSIBLE.")
+
+
+AGGREGATE = re.compile(r"\b(how many|number of|count|oldest|youngest|earliest|latest|most|least|largest|"
+                       r"smallest|first|last|total|average|highest|lowest)\b", re.I)
 
 
 def search_question(instr: str) -> str:
@@ -456,13 +567,23 @@ async def solve_search(llm: LLM, task_dir: Path, task: dict, log: list) -> Resul
     if kb is None:
         return None  # not a field-based kb: the agent loop handles it
     q = search_question(task["instruction"])
+    if not kb.mentioned(q):
+        # the entity is not a page of the graph (e.g. facts written as prose in one wiki
+        # file); recon already skipped names absent from the raw text, so read the files
+        return None
     ans, cost = await _path_try(llm, kb, q, CHEAP, log)
     if not ans:  # second opinion with the other model and the other view before giving up
         ans, c = await _subgraph_try(llm, kb, q, SECOND, log)
         cost += c
-        if not ans:
-            return Result(False, "", cost, "kb has no answer")
-    elif task.get("_verify"):
+    if not ans and AGGREGATE.search(q) and len(kb.whole()) <= 8000:
+        # "oldest", "how many": no single path answers it, the whole small kb does
+        reply, c = await llm.ask(SYS_SUBGRAPH, f"{kb.whole()}\n\nQ: {q}", model=CHEAP, max_tokens=60)
+        cost += c
+        ans = _value(reply)
+        log.append({"model": CHEAP, "mode": "whole", "reply": reply, "answer": ans, "cost": c})
+    if not ans:
+        return Result(False, "", cost, "kb has no answer")
+    if task.get("_verify"):
         ans, c = await cross_check(ans, [lambda: _subgraph_try(llm, kb, q, SECOND, log),
                                          lambda: _path_try(llm, kb, q, SECOND, log)], log)
         cost += c
@@ -471,25 +592,32 @@ async def solve_search(llm: LLM, task_dir: Path, task: dict, log: list) -> Resul
 
 
 # ---------------------------------------------------------------- generic agent
-def workspace_preview(ws: Path, budget: int = 1800) -> str:
+def workspace_preview(ws: Path, budget: int = 3500) -> str:
+    """File list + text files: whole when they are small (a 3 KB wiki page costs ~100 units
+    and saves the steps of reading it), otherwise their first lines."""
     if not ws.is_dir():
         return "(no files)"
-    out, used = [], 0
     files = sorted(p for p in ws.rglob("*") if p.is_file())
     listing = "\n".join(str(p.relative_to(ws)) for p in files[:60])
-    out.append("Files:\n" + listing + ("\n..." if len(files) > 60 else ""))
-    used = len(out[0])
+    out = ["Files:\n" + listing + ("\n..." if len(files) > 60 else "")]
+    texts = []
     for p in files:
-        if p.suffix not in (".csv", ".md", ".txt", ".json", ".py", ".tsv") or used > budget:
+        if p.suffix not in (".csv", ".md", ".txt", ".json", ".jsonl", ".py", ".tsv", ".log", ".yaml", ".yml", ".ini"):
             continue
         try:
-            head = "\n".join(p.read_text(errors="replace").splitlines()[:5])[:400]
+            texts.append((p, p.read_text(errors="replace")))
         except OSError:
             continue
-        chunk = f"\n--- head {p.relative_to(ws)} ---\n{head}"
+    whole = sum(len(t) for _, t in texts) <= budget
+    used = len(out[0])
+    for p, t in texts:
+        if used > budget:
+            break
+        body = t if whole else "\n".join(t.splitlines()[:5])[:400]
+        chunk = f"\n--- {'' if whole else 'head '}{p.relative_to(ws)} ---\n{body}"
         out.append(chunk)
         used += len(chunk)
-    return "".join(out)[:budget + 400]
+    return "".join(out)
 
 
 def parse_act(text: str) -> dict | None:
@@ -535,7 +663,8 @@ async def solve_agent(llm: LLM, task_dir: Path, task: dict, log: list,
                      {"role": "user", "content": 'Reply with one json object: {"cmd": ...} or {"answer": ...}'}]
         elif "answer" in act:
             ans = str(act["answer"]).strip()
-            if not ans or ans.upper() == "IMPOSSIBLE":
+            if (not ans or ans.upper().startswith("IMPOSSIBLE") or len(ans) > 80
+                    or re.search(r"\b(not (found|contain|available|present|provided)|no (information|data|record))\b", ans, re.I)):
                 return Result(False, "", cost, "model says impossible")
             write_answer(task_dir, ans)
             return Result(True, ans, cost)

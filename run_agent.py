@@ -24,7 +24,7 @@ import traceback
 from pathlib import Path
 
 from jw_harness import solvers
-from jw_harness.llm import BudgetExhausted, from_env
+from jw_harness.llm import BudgetExhausted, ProxyUnavailable, from_env
 
 # Measured mean cost per task in budget units (bench/runs, qwen3.6-35b-a3b-noreason).
 EST = {"math": 70, "coding_per_failure": 35, "coding_base": 20,
@@ -109,8 +109,10 @@ def recon(t: dict) -> None:
     if kb is not None:
         t["_kind"], t["_est"] = "search", EST["search_kb"]
         q = solvers.search_question(instr)
-        if not kb.mentioned(q) and kb.unknown_names(q):
-            t["_impossible"] = f"names {kb.unknown_names(q)} not in kb"
+        raw = workspace_text(ws).lower()
+        unknown = [n for n in kb.unknown_names(q) if n.lower() not in raw]
+        if not kb.mentioned(q) and unknown:
+            t["_impossible"] = f"names {unknown} not in kb"
         return
     if ttype == "data_analysis" and solvers.has_csv(ws):
         t["_kind"], t["_est"] = "data", EST["data"]
@@ -189,6 +191,9 @@ async def solve_one(llm, t: dict, sols: Solutions, traj_dir: Path, deadline: flo
                                                 cost_cap=t.get("_agent_cap", AGENT_CAP_MAX))
     except BudgetExhausted as e:
         res = solvers.Result(False, "", 0.0, f"budget: {e}")
+    except ProxyUnavailable as e:
+        log(f"{tid:24} proxy unavailable, will retry later: {e}")
+        return "retry"
     except Exception as e:  # noqa: BLE001
         res = solvers.Result(False, "", 0.0, f"error: {e}")
         trace.append({"traceback": traceback.format_exc()[-2000:]})
@@ -267,9 +272,18 @@ async def main_async(a) -> int:
                 t["_verify"] = t["_verify"] and rem > VERIFY_MIN_LEFT * budget
                 if rem < ENDGAME * budget:
                     async with endgame:
-                        await solve_one(llm, t, solutions, traj_dir, deadline)
+                        if await solve_one(llm, t, solutions, traj_dir, deadline) == "retry":
+                            await requeue(t)
                     continue
-            await solve_one(llm, t, solutions, traj_dir, deadline)
+            if await solve_one(llm, t, solutions, traj_dir, deadline) == "retry":
+                await requeue(t)
+
+    async def requeue(t):
+        # a network blip must not burn tasks: put it back a few times, after a pause
+        t["_retries"] = t.get("_retries", 0) + 1
+        if t["_retries"] <= 3:
+            await asyncio.sleep(15 * t["_retries"])
+            q.put_nowait(t)
 
     await asyncio.gather(*(worker() for _ in range(a.workers)))
     ok = sum(1 for v in solutions.data.values() if v.get("submitted"))

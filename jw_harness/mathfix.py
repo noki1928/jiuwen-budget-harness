@@ -12,16 +12,16 @@ import ast
 import math
 import re
 
-ALLOWED_CALLS = {"int", "min", "max", "abs", "round", "ceil", "floor", "sum"}
+ALLOWED_CALLS = {"int", "min", "max", "abs", "round", "ceil", "floor", "sum", "pow"}
 ALLOWED = (ast.Module, ast.Expression, ast.Expr, ast.Assign, ast.AugAssign, ast.Name,
            ast.Load, ast.Store, ast.Constant, ast.BinOp, ast.UnaryOp, ast.Call,
-           ast.Attribute, ast.List, ast.Tuple,
+           ast.Attribute, ast.List, ast.Tuple, ast.Subscript, ast.Slice,
            ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
            ast.USub, ast.UAdd,
            ast.If, ast.IfExp, ast.Compare, ast.BoolOp, ast.And, ast.Or, ast.Not,
            ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
 UNICODE = {"×": "*", "·": "*", "÷": "//", "−": "-", "–": "-", "^": "**", " ": " "}
-EXPR_LINE = re.compile(r"^[\s\w().+\-*/%,=]*\d[\s\w().+\-*/%,=]*$")
+EXPR_LINE = re.compile(r"^[\s\w().+\-*/%,=\[\]'\"]*\d[\s\w().+\-*/%,=\[\]'\"]*$")
 
 
 def _normalize(line: str) -> str:
@@ -68,14 +68,19 @@ def _safe(tree: ast.AST) -> bool:
         if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Pow):
             if not (isinstance(n.right, ast.Constant) and abs(n.right.value) <= 10):
                 return False
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "pow" and len(n.args) != 3:
+            return False  # only modular pow(a, b, m): bounded result
     return True
 
 
-ENV = {"__builtins__": {}, "int": int, "min": min, "max": max, "abs": abs, "round": round,
+ENV = {"__builtins__": {}, "pow": pow, "int": int, "min": min, "max": max, "abs": abs, "round": round,
        "sum": sum, "ceil": math.ceil, "floor": math.floor, "math": math}
 
 
 def _as_int(v) -> str | None:
+    if isinstance(v, str):  # word answers, e.g. a weekday picked from a list
+        v = v.strip()
+        return v if 0 < len(v) <= 60 else None
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
     if isinstance(v, float):

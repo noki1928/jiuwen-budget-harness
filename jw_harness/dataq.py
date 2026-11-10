@@ -14,6 +14,7 @@ answer string. Two query languages are supported:
 from __future__ import annotations
 
 import ast
+import json
 import math
 import re
 import sqlite3
@@ -25,8 +26,14 @@ import pandas as pd
 MAX_ROWS_PREVIEW = 3
 
 
-def csv_files(ws: Path) -> list[Path]:
-    return sorted(p for p in ws.rglob("*.csv") if p.is_file())
+DELIMS = [",", ";", "\t", "|"]
+TABULAR = {".csv", ".tsv", ".psv", ".txt", ".json", ".jsonl", ".ndjson"}
+
+
+def _delimiter(header: str) -> str | None:
+    counts = {d: header.count(d) for d in DELIMS}
+    best = max(counts, key=counts.get)
+    return best if counts[best] >= 1 else None
 
 
 def table_name(p: Path) -> str:
@@ -34,17 +41,70 @@ def table_name(p: Path) -> str:
     return n if not n[:1].isdigit() else f"t_{n}"
 
 
+def _records(p: Path) -> list | None:
+    text = p.read_text(errors="replace").strip()
+    if p.suffix in (".jsonl", ".ndjson"):
+        return [json.loads(l) for l in text.splitlines() if l.strip()]
+    data = json.loads(text)
+    if isinstance(data, dict):  # {"orders": [...]} or a single record
+        lists = [v for v in data.values() if isinstance(v, list) and v and isinstance(v[0], dict)]
+        data = lists[0] if len(lists) == 1 else [data]
+    return data if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+
+def _frames_of(p: Path) -> dict[str, pd.DataFrame]:
+    """One file -> its tables. JSON nested lists of records become child tables."""
+    name = table_name(p)
+    if p.suffix in (".json", ".jsonl", ".ndjson"):
+        recs = _records(p)
+        if recs is None:
+            return {}
+        out = {}
+        nested = {k for r in recs for k, v in r.items()
+                  if isinstance(v, list) and v and isinstance(v[0], dict)}
+        flat = [{k: v for k, v in r.items() if k not in nested} for r in recs]
+        parent = pd.json_normalize(flat, sep="_")
+        out[name] = parent
+        key = next((c for c in ("id", f"{p.stem}_id", "order_id", "key") if c in parent.columns), None)
+        for k in sorted(nested):
+            rows = []
+            for i, r in enumerate(recs):
+                for child in r.get(k) or []:
+                    if isinstance(child, dict):
+                        rows.append({f"{name}_{key or 'row'}": r.get(key) if key else i, **child})
+            out[f"{name}_{k}"] = pd.json_normalize(rows, sep="_")
+        return out
+    with p.open(errors="replace") as f:
+        header = f.readline()
+    sep = _delimiter(header)
+    if sep is None:
+        return {}
+    return {name: pd.read_csv(p, sep=sep, engine="python")}
+
+
+def data_files(ws: Path) -> list[Path]:
+    return sorted(p for p in ws.rglob("*") if p.is_file() and p.suffix.lower() in TABULAR)
+
+
 def load_frames(ws: Path) -> dict[str, pd.DataFrame]:
-    return {table_name(p): pd.read_csv(p) for p in csv_files(ws)}
+    out = {}
+    for p in data_files(ws):
+        try:
+            out.update(_frames_of(p))
+        except (ValueError, json.JSONDecodeError, pd.errors.ParserError, UnicodeError):
+            continue
+    return out
+
+
+def csv_files(ws: Path) -> list[Path]:  # kept for callers that only want delimited files
+    return [p for p in data_files(ws) if p.suffix.lower() not in (".json", ".jsonl", ".ndjson")]
 
 
 def preview(ws: Path) -> str:
-    """Header + first rows of each CSV, as compact as possible."""
+    """Columns + first rows of each table, as compact as possible."""
     out = []
-    for p in csv_files(ws):
-        lines = p.read_text(errors="replace").splitlines()
-        out.append(f"{table_name(p)} ({p.relative_to(ws)}, {max(len(lines) - 1, 0)} rows):\n"
-                   + "\n".join(lines[:1 + MAX_ROWS_PREVIEW]))
+    for name, df in load_frames(ws).items():
+        out.append(f"{name} ({len(df)} rows):\n" + df.head(MAX_ROWS_PREVIEW).to_csv(index=False).strip())
     return "\n\n".join(out)
 
 
