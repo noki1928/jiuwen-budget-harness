@@ -53,6 +53,36 @@ def write_answer(task_dir: Path, answer: str) -> None:
             (d / "answer.txt").write_text(answer.strip() + "\n")
 
 
+def same_answer(a: str | None, b: str | None) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except ValueError:
+        return a.strip().casefold() == b.strip().casefold()
+
+
+async def cross_check(first: str, alternatives: list, log: list) -> tuple[str, float]:
+    """Second independent answer; on disagreement a third one decides by majority.
+
+    `alternatives` are async callables returning (answer | None, cost). Returns the
+    chosen answer (the first one when nothing agrees) and the extra cost.
+    """
+    cost, seen = 0.0, [first]
+    for alt in alternatives[:2]:
+        ans, c = await alt()
+        cost += c
+        if same_answer(ans, first):
+            log.append({"verify": "agree", "answer": first})
+            return first, cost
+        if any(same_answer(ans, x) for x in seen[1:]):
+            log.append({"verify": "majority", "answer": ans, "first": first})
+            return ans, cost
+        seen.append(ans)
+    log.append({"verify": "no majority, keep first", "answers": seen})
+    return first, cost
+
+
 def instruction_core(instr: str) -> str:
     """Drop the shared boilerplate tail (tools hint, answer.txt rules)."""
     return re.split(r"\s(?:Compute it with|Use bash|Use the file tools|Work only inside)", instr)[0]
@@ -249,22 +279,42 @@ def is_math_word_problem(task: dict) -> bool:
     return task.get("task_type") == "math" and not (Path(task["_dir"]) / "workspace").is_dir()
 
 
+SYS_EXPR = ("Translate the word problem into ONE Python expression, do NOT compute it yourself. "
+            "Use // for rounding down, ceil(a/b) for rounding up, % for remainder. Reply ONLY with the expression.")
+
+
+async def _math_try(llm: LLM, q: str, model: str, system: str, log: list) -> tuple[str | None, float, str]:
+    """(answer, cost, problem) for one translation of the question into code."""
+    reply, c = await llm.ask(system, q, model=model, max_tokens=300)
+    ans = solve_reply(reply)
+    log.append({"model": model, "prompt": q, "reply": reply, "answer": ans, "cost": c})
+    start = re.search(r"^\s*x\s*=\s*(-?\d+)\s*$", reply, flags=re.M)
+    if start and start.group(1) not in re.findall(r"\d+", q):
+        # e.g. "x = 1000" copied from the prompt example: the question has no starting value
+        return None, c, f"start value {start.group(1)} not in the question"
+    if ans is None or ans.startswith("-"):
+        return None, c, "no evaluable program"
+    return ans, c, ""
+
+
 async def solve_math(llm: LLM, task_dir: Path, task: dict, log: list) -> Result:
     q = instruction_core(task["instruction"])
-    cost = 0.0
+    cost, ans, problem = 0.0, None, ""
     for model in (CHEAP, SECOND):
-        reply, c = await llm.ask(SYS_STEPS, q, model=model, max_tokens=300)
+        ans, c, problem = await _math_try(llm, q, model, SYS_STEPS, log)
         cost += c
-        ans = solve_reply(reply)
-        log.append({"model": model, "prompt": q, "reply": reply, "answer": ans, "cost": c})
-        start = re.search(r"^\s*x\s*=\s*(-?\d+)\s*$", reply, flags=re.M)
-        if start and start.group(1) not in re.findall(r"\d+", q):
-            # e.g. "x = 1000" copied from the prompt example: the question has no starting value
-            return Result(False, "", cost, f"start value {start.group(1)} not in the question")
-        if ans is not None and not ans.startswith("-"):
-            write_answer(task_dir, ans)
-            return Result(True, ans, cost)
-    return Result(False, "", cost, "no evaluable program")
+        if ans is not None or problem.startswith("start value"):
+            break
+    if ans is None:
+        return Result(False, "", cost, problem)
+    if task.get("_verify"):
+        async def alt(model, system):
+            a, c, _ = await _math_try(llm, q, model, system, log)
+            return a, c
+        ans, c = await cross_check(ans, [lambda: alt(SECOND, SYS_STEPS), lambda: alt(CHEAP, SYS_EXPR)], log)
+        cost += c
+    write_answer(task_dir, ans)
+    return Result(True, ans, cost)
 
 
 # ---------------------------------------------------------------- data_analysis
@@ -286,34 +336,53 @@ def has_csv(ws: Path) -> bool:
     return ws.is_dir() and any(ws.rglob("*.csv"))
 
 
-async def solve_data(llm: LLM, task_dir: Path, task: dict, log: list) -> Result | None:
+async def _data_try(llm: LLM, ws: Path, user: str, model: str, mode: str, log: list):
+    """(answer, error, cost): one query, one retry with the execution error."""
     from . import dataq  # pandas import is heavy: only when a data task shows up
+    msgs = [{"role": "user", "content": user}]
+    cost, err, ans = 0.0, "", None
+    for _ in range(2):
+        reply, c = await llm.ask(SYS_QUERY[mode], msgs, model=model, max_tokens=300)
+        cost += c
+        err, ans = "", None
+        try:
+            ans = await asyncio.to_thread(dataq.RUNNERS[mode], ws, reply)
+            if ans is None:
+                err = "query returned no value"
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {str(e)[:200]}"
+        if not err and mode == "sql" and not re.search(r"\bfrom\b", reply, re.I):
+            err = "constant query"  # "SELECT 0": the model gave up on the data
+        log.append({"model": model, "mode": mode, "reply": reply, "answer": ans, "error": err, "cost": c})
+        if not err or err in ("query returned no value", "constant query") or _missing_column(err, ws):
+            break
+        msgs += [{"role": "assistant", "content": reply},
+                 {"role": "user", "content": f"Error: {err}\nReply with a corrected query only."}]
+    return (None if err else ans), err, cost
+
+
+async def solve_data(llm: LLM, task_dir: Path, task: dict, log: list) -> Result | None:
+    from . import dataq
     ws = task_dir / "workspace"
     user = f"{dataq.preview(ws)}\n\nQ: {data_question(task['instruction'])}"
-    cost = 0.0
+    cost, ans = 0.0, None
     for model, mode in ((CHEAP, "sql"), (SECOND, "pandas")):
-        msgs = [{"role": "user", "content": user}]
-        for _ in range(2):  # one retry with the execution error
-            reply, c = await llm.ask(SYS_QUERY[mode], msgs, model=model, max_tokens=300)
-            cost += c
-            err, ans = "", None
-            try:
-                ans = await asyncio.to_thread(dataq.RUNNERS[mode], ws, reply)
-                if ans is None:
-                    err = "query returned no value"
-            except Exception as e:  # noqa: BLE001
-                err = f"{type(e).__name__}: {str(e)[:200]}"
-            log.append({"model": model, "mode": mode, "reply": reply, "answer": ans, "error": err, "cost": c})
-            if not err and mode == "sql" and not re.search(r"\bfrom\b", reply, re.I):
-                err = "constant query"  # "SELECT 0": the model gave up on the data
-            if not err:
-                write_answer(task_dir, ans)
-                return Result(True, ans, cost)
-            if err in ("query returned no value", "constant query") or _missing_column(err, ws):
-                return Result(False, "", cost, f"infeasible: {err}")
-            msgs += [{"role": "assistant", "content": reply},
-                     {"role": "user", "content": f"Error: {err}\nReply with a corrected query only."}]
-    return None  # let the agent loop try
+        ans, err, c = await _data_try(llm, ws, user, model, mode, log)
+        cost += c
+        if ans is not None:
+            break
+        if err in ("query returned no value", "constant query") or _missing_column(err, ws):
+            return Result(False, "", cost, f"infeasible: {err}")
+    if ans is None:
+        return None  # let the agent loop try
+    if task.get("_verify"):
+        async def alt(model, mode):
+            a, _, c = await _data_try(llm, ws, user, model, mode, log)
+            return a, c
+        ans, c = await cross_check(ans, [lambda: alt(SECOND, "pandas"), lambda: alt(SECOND, "sql")], log)
+        cost += c
+    write_answer(task_dir, ans)
+    return Result(True, ans, cost)
 
 
 def _missing_column(err: str, ws: Path) -> bool:
@@ -353,40 +422,52 @@ def _value(reply: str) -> str | None:
     return None if not v or v.upper().startswith("IMPOSSIBLE") else v
 
 
-async def solve_search(llm: LLM, task_dir: Path, task: dict, log: list) -> Result | None:
-    kb = load_kb(task_dir / "workspace")
-    if kb is None:
-        return None  # not a field-based kb: the agent loop handles it
-    q = search_question(task["instruction"])
-    cost = 0.0
+async def _path_try(llm: LLM, kb, q: str, model: str, log: list) -> tuple[str | None, float]:
     ment = kb.mentioned(q)
     msgs = [{"role": "user", "content": f"Fields:\n{kb.schema()}\n\nQ: {q}"}]
+    cost = 0.0
     for _ in range(2):  # one retry with the lookup error
-        reply, c = await llm.ask(SYS_PATH, msgs, model=CHEAP, max_tokens=60)
+        reply, c = await llm.ask(SYS_PATH, msgs, model=model, max_tokens=60)
         cost += c
         try:
             ans, err = kb.follow(reply, ment[0] if len(ment) == 1 else None), ""
         except LookupError as e:
             ans, err = None, str(e)
-        log.append({"model": CHEAP, "mode": "path", "reply": reply, "answer": ans, "error": err, "cost": c})
-        if ans:
-            write_answer(task_dir, ans)
-            return Result(True, ans, cost)
-        if err == "IMPOSSIBLE":
-            break
+        log.append({"model": model, "mode": "path", "reply": reply, "answer": ans, "error": err, "cost": c})
+        if ans or err == "IMPOSSIBLE":
+            return ans, cost
         msgs += [{"role": "assistant", "content": reply},
                  {"role": "user", "content": f"Error: {err}\nReply with a corrected path or IMPOSSIBLE."}]
-    # second opinion with the other model and the other view before giving up
+    return None, cost
+
+
+async def _subgraph_try(llm: LLM, kb, q: str, model: str, log: list) -> tuple[str | None, float]:
     facts = kb.subgraph(q)
-    if facts:
-        reply, c = await llm.ask(SYS_SUBGRAPH, f"{facts}\n\nQ: {q}", model=SECOND, max_tokens=60)
+    if not facts:
+        return None, 0.0
+    reply, c = await llm.ask(SYS_SUBGRAPH, f"{facts}\n\nQ: {q}", model=model, max_tokens=60)
+    ans = _value(reply)
+    log.append({"model": model, "mode": "subgraph", "reply": reply, "answer": ans, "cost": c})
+    return ans, c
+
+
+async def solve_search(llm: LLM, task_dir: Path, task: dict, log: list) -> Result | None:
+    kb = load_kb(task_dir / "workspace")
+    if kb is None:
+        return None  # not a field-based kb: the agent loop handles it
+    q = search_question(task["instruction"])
+    ans, cost = await _path_try(llm, kb, q, CHEAP, log)
+    if not ans:  # second opinion with the other model and the other view before giving up
+        ans, c = await _subgraph_try(llm, kb, q, SECOND, log)
         cost += c
-        ans = _value(reply)
-        log.append({"model": SECOND, "mode": "subgraph", "reply": reply, "answer": ans, "cost": c})
-        if ans:
-            write_answer(task_dir, ans)
-            return Result(True, ans, cost)
-    return Result(False, "", cost, "kb has no answer")
+        if not ans:
+            return Result(False, "", cost, "kb has no answer")
+    elif task.get("_verify"):
+        ans, c = await cross_check(ans, [lambda: _subgraph_try(llm, kb, q, SECOND, log),
+                                         lambda: _path_try(llm, kb, q, SECOND, log)], log)
+        cost += c
+    write_answer(task_dir, ans)
+    return Result(True, ans, cost)
 
 
 # ---------------------------------------------------------------- generic agent

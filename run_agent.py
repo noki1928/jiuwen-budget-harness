@@ -30,6 +30,13 @@ from jw_harness.llm import BudgetExhausted, from_env
 EST = {"math": 70, "coding_per_failure": 35, "coding_base": 20,
        "data": 40, "search_kb": 25, "data_analysis": 250, "search": 300, "other": 1500}
 TIME_LIMIT_S = float(os.environ.get("TIME_LIMIT_S", 52 * 60))  # the container is killed at 60 min
+# Competition budget in output tokens (input/10 + output). The proxy is the source of truth;
+# we stop a bit earlier so that the last tasks are not cut off mid-way.
+BUDGET = float(os.environ.get("TOKEN_BUDGET", 100_000))
+RESERVE = 0.05          # never plan on the last 5%
+ENDGAME = 0.10          # below 10% left: one task at a time, fewer half-paid unfinished tasks
+VERIFY_MIN_LEFT = 0.30  # cross-checks only while more than 30% of the budget is left
+AGENT_CAP_MAX = 2500
 
 
 def log(msg: str) -> None:
@@ -178,7 +185,8 @@ async def solve_one(llm, t: dict, sols: Solutions, traj_dir: Path, deadline: flo
             if t["_suspect"]:  # likely infeasible: a short, cheap look only
                 res = await solvers.solve_agent(llm, d, t, trace, max_steps=3, cost_cap=300)
             else:
-                res = await solvers.solve_agent(llm, d, t, trace)
+                res = await solvers.solve_agent(llm, d, t, trace,
+                                                cost_cap=t.get("_agent_cap", AGENT_CAP_MAX))
     except BudgetExhausted as e:
         res = solvers.Result(False, "", 0.0, f"budget: {e}")
     except Exception as e:  # noqa: BLE001
@@ -186,7 +194,7 @@ async def solve_one(llm, t: dict, sols: Solutions, traj_dir: Path, deadline: flo
         trace.append({"traceback": traceback.format_exc()[-2000:]})
     spent = sum(x.get("cost", 0) for x in trace if isinstance(x, dict))
     entry = {"task_id": tid, "answer": res.answer, "submitted": res.ok, "reward": t["_reward"],
-             "kind": t["_kind"], "est": t["_est"], "spent": round(spent, 1),
+             "kind": t["_kind"], "est": t["_est"], "spent": round(spent, 1), "verified": t.get("_verify", False),
              "seconds": round(time.monotonic() - t0, 1), "note": res.note}
     if res.ok:
         await sols.record(tid, entry)
@@ -206,16 +214,21 @@ async def main_async(a) -> int:
     deadline = start + TIME_LIMIT_S
 
     await asyncio.gather(*(asyncio.to_thread(recon, t) for t in tasks))
-    budget = float(os.environ["TOKEN_BUDGET"]) if os.environ.get("TOKEN_BUDGET") else None
+    budget = BUDGET * (1 - RESERVE) if BUDGET > 0 else None
+    rewards = sorted(t["_reward"] for t in tasks)
+    # cross-check the top quarter by reward (when rewards differ at all)
+    verify_from = rewards[int(len(rewards) * 0.75)] if rewards else 0
     for t in tasks:
         t["_prio"] = t["_reward"] / max(t["_est"], 1)
+        t["_verify"] = bool(rewards) and t["_reward"] >= verify_from and t["_reward"] > rewards[0]
     order = sorted(tasks, key=lambda t: (bool(t["_suspect"]), -t["_prio"]))
     for t in order:
         log(f"plan {t['task_id']:24} kind={t['_kind']:6} reward={t['_reward']:<4} est={t['_est']:<5}"
             f" {('SUSPECT: ' + t['_suspect']) if t['_suspect'] else ''}")
 
     sols = solutions_path(a.out, tasks_dir)
-    log(f"solutions file: {sols}")
+    log(f"solutions file: {sols}; budget {BUDGET:.0f} (planning on {budget or 0:.0f}); "
+        f"cross-check rewards >= {verify_from:g}")
     traj_dir = Path(os.environ.get("TRAJ_DIR", "/tmp/trajectories"))
     traj_dir.mkdir(parents=True, exist_ok=True)
     solutions = Solutions(sols)
@@ -239,13 +252,23 @@ async def main_async(a) -> int:
     for t in queue:
         q.put_nowait(t)
 
+    endgame = asyncio.Lock()
+
     async def worker():
         while not q.empty() and not llm.dead:
             t = q.get_nowait()
             rem = llm.remaining()
-            if rem is not None and rem < t["_est"] * 0.5:
-                log(f"skip {t['task_id']}: est {t['_est']} > remaining {rem:.0f}")
-                continue
+            if rem is not None:
+                if rem < t["_est"] * 0.5:
+                    log(f"skip {t['task_id']}: est {t['_est']} > remaining {rem:.0f}")
+                    continue
+                # the agent loop may take at most an even share of what is left
+                t["_agent_cap"] = min(AGENT_CAP_MAX, max(300.0, rem / (q.qsize() + 1)))
+                t["_verify"] = t["_verify"] and rem > VERIFY_MIN_LEFT * budget
+                if rem < ENDGAME * budget:
+                    async with endgame:
+                        await solve_one(llm, t, solutions, traj_dir, deadline)
+                    continue
             await solve_one(llm, t, solutions, traj_dir, deadline)
 
     await asyncio.gather(*(worker() for _ in range(a.workers)))
