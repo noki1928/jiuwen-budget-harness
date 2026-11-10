@@ -78,23 +78,41 @@ def coding_target(task: dict, ws: Path) -> tuple[str, str] | None:
     return None
 
 
+_CONST_NODES = (ast.Expression, ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.BinOp, ast.UnaryOp,
+                ast.IfExp, ast.Compare, ast.BoolOp, ast.Load, ast.operator, ast.unaryop, ast.cmpop, ast.boolop)
+
+
+def _const_value(node: ast.AST):
+    """Value of an expected-value expression built from literals only (`[1, 3] * 2`, `x if False else y`)."""
+    expr = ast.Expression(node)
+    if not all(isinstance(n, _CONST_NODES) for n in ast.walk(expr)):
+        raise ValueError("not a constant expression")
+    if any(isinstance(n, ast.BinOp) and isinstance(n.op, ast.Pow) for n in ast.walk(expr)):
+        raise ValueError("pow")
+    return eval(compile(expr, "<expected>", "eval"), {"__builtins__": {}}, {})
+
+
 def contradictory_tests(ws: Path, test: str) -> str:
-    """Same call asserted equal to different constants -> no fix can pass all tests."""
+    """The same call is expected to give different values -> no fix can pass all tests."""
     try:
         tree = ast.parse((ws / test).read_text())
     except (SyntaxError, OSError):
         return ""
     seen: dict[str, set[str]] = {}
     for n in ast.walk(tree):
-        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "assertEqual" and len(n.args) >= 2):
-            a, b = n.args[0], n.args[1]
-            if isinstance(a, ast.Constant) and not isinstance(b, ast.Constant):
-                a, b = b, a
-            try:
-                seen.setdefault(ast.unparse(a), set()).add(repr(ast.literal_eval(b)))
-            except (ValueError, TypeError, SyntaxError):
-                continue
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.args):
+            continue
+        attr = n.func.attr
+        try:
+            if attr == "assertEqual" and len(n.args) >= 2:
+                a, b = n.args[0], n.args[1]
+                if isinstance(a, ast.Constant) and not isinstance(b, ast.Constant):
+                    a, b = b, a
+                seen.setdefault(ast.unparse(a), set()).add(repr(_const_value(b)))
+            elif attr in ("assertTrue", "assertFalse"):
+                seen.setdefault(f"bool({ast.unparse(n.args[0])})", set()).add(repr(attr == "assertTrue"))
+        except (ValueError, TypeError, SyntaxError, ArithmeticError):
+            continue
     bad = [k for k, v in seen.items() if len(v) > 1]
     return f"contradictory asserts for {bad[0]}" if bad else ""
 
@@ -147,11 +165,19 @@ def apply_line(src: str, reply: str) -> str:
         i = int(m.group(1))
         if 1 <= i <= len(lines):
             old = lines[i - 1]
-            # indentation is always taken from the original line: models miscount spaces
-            lines[i - 1] = old[:len(old) - len(old.lstrip())] + m.group(2).strip()
+            code = m.group(2).strip()
+            if old.strip():
+                # indentation is always taken from the original line: models miscount spaces
+                lines[i - 1] = old[:len(old) - len(old.lstrip())] + code
+            elif code:
+                # the model grew a function into the blank line after it: use the body's indent,
+                # keep the blank separator
+                prev = next((l for l in reversed(lines[:i - 1]) if l.strip()), "")
+                indent = prev[:len(prev) - len(prev.lstrip())] or "    "
+                lines[i - 1] = indent + code + "\n"
     out = "\n".join(lines) + "\n"
     try:
-        ast.parse(out)
+        compile(out, "mylib.py", "exec")  # ast.parse misses e.g. 'return' outside a function
     except SyntaxError:
         return src
     return out
@@ -213,6 +239,12 @@ async def solve_coding(llm: LLM, task_dir: Path, task: dict, log: list) -> Resul
 
 
 # ---------------------------------------------------------------- math
+def math_missing_numbers(instr: str) -> bool:
+    """The first sentence (the starting state) has no number, e.g. 'A library owns some books.'"""
+    first = re.split(r"(?<=[.?!])\s", instruction_core(instr), maxsplit=1)[0]
+    return not re.search(r"\d", first)
+
+
 def is_math_word_problem(task: dict) -> bool:
     return task.get("task_type") == "math" and not (Path(task["_dir"]) / "workspace").is_dir()
 
@@ -225,6 +257,10 @@ async def solve_math(llm: LLM, task_dir: Path, task: dict, log: list) -> Result:
         cost += c
         ans = solve_reply(reply)
         log.append({"model": model, "prompt": q, "reply": reply, "answer": ans, "cost": c})
+        start = re.search(r"^\s*x\s*=\s*(-?\d+)\s*$", reply, flags=re.M)
+        if start and start.group(1) not in re.findall(r"\d+", q):
+            # e.g. "x = 1000" copied from the prompt example: the question has no starting value
+            return Result(False, "", cost, f"start value {start.group(1)} not in the question")
         if ans is not None and not ans.startswith("-"):
             write_answer(task_dir, ans)
             return Result(True, ans, cost)
@@ -268,18 +304,35 @@ async def solve_data(llm: LLM, task_dir: Path, task: dict, log: list) -> Result 
             except Exception as e:  # noqa: BLE001
                 err = f"{type(e).__name__}: {str(e)[:200]}"
             log.append({"model": model, "mode": mode, "reply": reply, "answer": ans, "error": err, "cost": c})
+            if not err and mode == "sql" and not re.search(r"\bfrom\b", reply, re.I):
+                err = "constant query"  # "SELECT 0": the model gave up on the data
             if not err:
                 write_answer(task_dir, ans)
                 return Result(True, ans, cost)
+            if err in ("query returned no value", "constant query") or _missing_column(err, ws):
+                return Result(False, "", cost, f"infeasible: {err}")
             msgs += [{"role": "assistant", "content": reply},
                      {"role": "user", "content": f"Error: {err}\nReply with a corrected query only."}]
     return None  # let the agent loop try
 
 
+def _missing_column(err: str, ws: Path) -> bool:
+    """'no such column: discount' / KeyError 'discount' for a name that is in no CSV header."""
+    m = re.search(r"no such column: (\w+)|KeyError: \W*(\w+)", err)
+    if not m:
+        return False
+    col = (m.group(1) or m.group(2)).lower()
+    headers = set()
+    for p in ws.rglob("*.csv"):
+        with p.open(errors="replace") as f:
+            headers |= {h.strip().lower() for h in f.readline().split(",")}
+    return col not in headers
+
+
 # ---------------------------------------------------------------- search
-# The kb is parsed into an entity graph by the wrapper (kbgraph.py). Measured on 62 tasks
-# (1-3 hops, 7 infeasible): subgraph 62/62 at ~20 units on both models, path query 62/62
-# (35b) / 61/62 (27b) at ~20, whole kb 49/62 at ~89, the agent loop ~180-280.
+# The kb is parsed into an entity graph by the wrapper (kbgraph.py). Measured on 62+25 tasks
+# (1-3 hops): path query 87/87 (35b) at ~21 units, subgraph 85/87 (35b; misses 3-hop chains),
+# whole kb 49/62 at ~89, the agent loop 48/55 at ~294.
 SYS_SUBGRAPH = "Answer from the facts below with the value only. If they do not contain the answer, reply IMPOSSIBLE."
 SYS_PATH = ("Reply with a path that answers the question: the name from the question, then fields from the list. "
             "Example: Anna Kim > Employer > Headquarters. If the data cannot answer it, reply IMPOSSIBLE.")
@@ -306,26 +359,16 @@ async def solve_search(llm: LLM, task_dir: Path, task: dict, log: list) -> Resul
         return None  # not a field-based kb: the agent loop handles it
     q = search_question(task["instruction"])
     cost = 0.0
-    facts = kb.subgraph(q)
-    if facts:
-        reply, c = await llm.ask(SYS_SUBGRAPH, f"{facts}\n\nQ: {q}", model=CHEAP, max_tokens=60)
-        cost += c
-        ans = _value(reply)
-        log.append({"model": CHEAP, "mode": "subgraph", "reply": reply, "answer": ans, "cost": c})
-        if ans:
-            write_answer(task_dir, ans)
-            return Result(True, ans, cost)
-    # second opinion with the other model and the other view before giving up
     ment = kb.mentioned(q)
     msgs = [{"role": "user", "content": f"Fields:\n{kb.schema()}\n\nQ: {q}"}]
-    for _ in range(2):
-        reply, c = await llm.ask(SYS_PATH, msgs, model=SECOND, max_tokens=60)
+    for _ in range(2):  # one retry with the lookup error
+        reply, c = await llm.ask(SYS_PATH, msgs, model=CHEAP, max_tokens=60)
         cost += c
         try:
             ans, err = kb.follow(reply, ment[0] if len(ment) == 1 else None), ""
         except LookupError as e:
             ans, err = None, str(e)
-        log.append({"model": SECOND, "mode": "path", "reply": reply, "answer": ans, "error": err, "cost": c})
+        log.append({"model": CHEAP, "mode": "path", "reply": reply, "answer": ans, "error": err, "cost": c})
         if ans:
             write_answer(task_dir, ans)
             return Result(True, ans, cost)
@@ -333,6 +376,16 @@ async def solve_search(llm: LLM, task_dir: Path, task: dict, log: list) -> Resul
             break
         msgs += [{"role": "assistant", "content": reply},
                  {"role": "user", "content": f"Error: {err}\nReply with a corrected path or IMPOSSIBLE."}]
+    # second opinion with the other model and the other view before giving up
+    facts = kb.subgraph(q)
+    if facts:
+        reply, c = await llm.ask(SYS_SUBGRAPH, f"{facts}\n\nQ: {q}", model=SECOND, max_tokens=60)
+        cost += c
+        ans = _value(reply)
+        log.append({"model": SECOND, "mode": "subgraph", "reply": reply, "answer": ans, "cost": c})
+        if ans:
+            write_answer(task_dir, ans)
+            return Result(True, ans, cost)
     return Result(False, "", cost, "kb has no answer")
 
 

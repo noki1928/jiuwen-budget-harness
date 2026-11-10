@@ -95,6 +95,8 @@ def recon(t: dict) -> None:
         return
     if ttype == "math" and not ws.is_dir():
         t["_kind"], t["_est"] = "math", EST["math"]
+        if solvers.math_missing_numbers(instr):
+            t["_impossible"] = "no number in the starting sentence"
         return
     kb = solvers.load_kb(ws) if ttype == "search" else None
     if kb is not None:
@@ -118,7 +120,10 @@ def recon(t: dict) -> None:
         t["_suspect"] = f"names {names} not in kb"
     quoted = QUOTED_RE.findall(instr)
     if ttype == "data_analysis" and quoted and not any(q in text for q in quoted):
-        t["_suspect"] = f"values {quoted} not in data"
+        if t["_kind"] == "data":  # the query would only select nothing
+            t["_impossible"] = f"values {quoted} not in data"
+        else:
+            t["_suspect"] = f"values {quoted} not in data"
 
 
 # ------------------------------------------------------------------ output
